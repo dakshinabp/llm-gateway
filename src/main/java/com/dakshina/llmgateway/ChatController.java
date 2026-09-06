@@ -9,8 +9,15 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/v1")
 public class ChatController {
 
+    private final AnthropicClient anthropicClient;
+
+    public ChatController(AnthropicClient anthropicClient) {
+        this.anthropicClient = anthropicClient;
+    }
+
     @PostMapping("/chat")
     public ChatResponse chat(@RequestBody ChatRequest request) {
-        return new ChatResponse("You said: " + request.prompt());
+        String text = anthropicClient.complete(request.prompt());
+        return new ChatResponse(text);
     }
 }
