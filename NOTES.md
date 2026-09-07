@@ -52,3 +52,48 @@ what unblocked the rest.
 
 Working locally: `POST /v1/chat` → Anthropic → response. Committed and pushed.
 Not done: Dockerfile, deploy. Those are session 2.
+
+## Session 2 — Sep 7, 2026: auth, Docker, deploy
+
+**Gateway auth**
+Two separate keys now, and conflating them would be a security bug:
+- `ANTHROPIC_API_KEY` — what the gateway uses downstream. Costs money.
+- `GATEWAY_API_KEY` — what callers present to the gateway. Generated with
+  `openssl rand -hex 32`.
+
+Enforced in `ApiKeyFilter`, a `OncePerRequestFilter`. A filter runs before the
+controller on every request; if it doesn't call `filterChain.doFilter(...)`, the
+request stops there. One place to change, protects every endpoint I add later.
+Only `/v1/` paths are checked — `/actuator/health` stays open because the deploy
+platform polls it without credentials. 401 (not 403): "I don't know who you are."
+
+Rate limiting will go in this same filter — it has to happen before any work.
+
+**Local secrets**
+Env vars don't cross terminal tabs. Lost 20 minutes to exporting keys in the
+wrong tab. Fixed with a gitignored `env.sh` that I `source` at the start of a
+session. Convention now: Tab 1 = server, Tab 2 = commands.
+
+**Dockerfile — multi-stage**
+Stage 1 (`21-jdk`) compiles the jar. Stage 2 (`21-jre`) copies just the jar
+across. Build tools never reach the final image: ~200MB instead of ~700MB, and no
+compiler in production. No secrets in the image — injected at runtime.
+
+**Deploy — Render free tier**
+- Needed `server.port=${PORT:8080}`. Platforms assign the port via a `PORT` env
+  var; hardcoding 8080 gives you "no open ports detected" and a failed deploy.
+- Env vars set in Render's dashboard, same names as `env.sh`. Same code, both
+  environments — the artifact doesn't change, the config does.
+- Health check path set to `/actuator/health`.
+- Free tier spins down after 15 min idle; first request after that takes ~1 min.
+
+**Verified in production**
+- `GET /actuator/health` → 200 `{"status":"UP"}`
+- `POST /v1/chat` with key → real model response
+- `POST /v1/chat` without key → 401
+
+**Still outstanding**
+- No retries, no timeout on the downstream call.
+- `content().get(0)` still throws on an error or empty response → 500.
+- No rate limiting, so a leaked gateway key can still drain the credit.
+- No README yet.
