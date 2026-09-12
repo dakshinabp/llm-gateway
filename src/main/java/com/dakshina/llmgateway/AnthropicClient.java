@@ -1,7 +1,10 @@
 package com.dakshina.llmgateway;
 
+import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
@@ -14,7 +17,16 @@ public class AnthropicClient {
     private final RestClient restClient;
 
     public AnthropicClient(@Value("${anthropic.api-key}") String apiKey) {
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+
+        JdkClientHttpRequestFactory requestFactory =
+                new JdkClientHttpRequestFactory(httpClient);
+        requestFactory.setReadTimeout(Duration.ofSeconds(30));
+
         this.restClient = RestClient.builder()
+                .requestFactory(requestFactory)
                 .baseUrl("https://api.anthropic.com")
                 .defaultHeader("x-api-key", apiKey)
                 .defaultHeader("anthropic-version", "2023-06-01")
