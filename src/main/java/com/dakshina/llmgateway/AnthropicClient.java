@@ -3,6 +3,9 @@ package com.dakshina.llmgateway;
 import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -10,17 +13,22 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
-import org.springframework.web.server.ResponseStatusException;
 
 @Service
 public class AnthropicClient {
 
+    private static final Logger log = LoggerFactory.getLogger(AnthropicClient.class);
+
     private static final String MODEL = "claude-sonnet-4-5";
     private static final int MAX_TOKENS = 1024;
+    private static final int MAX_ATTEMPTS = 3;
+    private static final long BASE_BACKOFF_MS = 500;
 
     private final RestClient restClient;
 
-    public AnthropicClient(@Value("${anthropic.api-key}") String apiKey) {
+    public AnthropicClient(@Value("${anthropic.api-key}") String apiKey,
+                           @Value("${anthropic.base-url}") String baseUrl) {
+
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
@@ -31,7 +39,7 @@ public class AnthropicClient {
 
         this.restClient = RestClient.builder()
                 .requestFactory(requestFactory)
-                .baseUrl("https://api.anthropic.com")
+                .baseUrl(baseUrl)
                 .defaultHeader("x-api-key", apiKey)
                 .defaultHeader("anthropic-version", "2023-06-01")
                 .defaultHeader("content-type", "application/json")
@@ -44,6 +52,23 @@ public class AnthropicClient {
                 MAX_TOKENS,
                 List.of(new AnthropicRequest.Message("user", prompt)));
 
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return callOnce(body);
+            } catch (DownstreamException e) {
+                if (!e.retryable() || attempt == MAX_ATTEMPTS) {
+                    log.warn("giving up after {} attempt(s): {}", attempt, e.getMessage());
+                    throw e;
+                }
+                long delay = backoffMillis(attempt);
+                log.warn("attempt {} failed ({}), retrying in {}ms",
+                        attempt, e.getMessage(), delay);
+                sleep(delay);
+            }
+        }
+    }
+
+    private String callOnce(AnthropicRequest body) {
         AnthropicResponse response;
         try {
             response = restClient.post()
@@ -54,28 +79,44 @@ public class AnthropicClient {
         } catch (RestClientResponseException e) {
             throw translate(e);
         } catch (ResourceAccessException e) {
-            throw new ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT,
-                    "model provider did not respond in time");
+            throw new DownstreamException(HttpStatus.GATEWAY_TIMEOUT,
+                    "model provider did not respond in time", true);
         }
 
         if (response == null || response.content() == null || response.content().isEmpty()) {
-            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                    "model provider returned an empty response");
+            throw new DownstreamException(HttpStatus.BAD_GATEWAY,
+                    "model provider returned an empty response", false);
         }
 
         return response.content().get(0).text();
     }
 
-    private ResponseStatusException translate(RestClientResponseException e) {
+    private DownstreamException translate(RestClientResponseException e) {
         return switch (e.getStatusCode().value()) {
-            case 400 -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "model provider rejected the request");
-            case 401, 403 -> new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                    "gateway is not authorized with the model provider");
-            case 429 -> new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,
-                    "model provider rate limit reached");
-            default -> new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                    "model provider error");
+            case 400 -> new DownstreamException(HttpStatus.BAD_REQUEST,
+                    "model provider rejected the request", false);
+            case 401, 403 -> new DownstreamException(HttpStatus.BAD_GATEWAY,
+                    "gateway is not authorized with the model provider", false);
+            case 429 -> new DownstreamException(HttpStatus.TOO_MANY_REQUESTS,
+                    "model provider rate limit reached", true);
+            default -> new DownstreamException(HttpStatus.BAD_GATEWAY,
+                    "model provider error", e.getStatusCode().is5xxServerError());
         };
+    }
+
+    private long backoffMillis(int attempt) {
+        long exponential = BASE_BACKOFF_MS * (1L << (attempt - 1));
+        long jitter = ThreadLocalRandom.current().nextLong(BASE_BACKOFF_MS / 2);
+        return exponential + jitter;
+    }
+
+    private void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DownstreamException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "request interrupted", false);
+        }
     }
 }

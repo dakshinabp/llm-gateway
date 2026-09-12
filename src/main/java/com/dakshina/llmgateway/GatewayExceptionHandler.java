@@ -16,4 +16,11 @@ public class GatewayExceptionHandler {
                 .status(ex.getStatusCode())
                 .body(new ApiError(ex.getStatusCode().value(), ex.getReason()));
     }
+
+    @ExceptionHandler(DownstreamException.class)
+    public ResponseEntity<ApiError> handleDownstream(DownstreamException ex) {
+        return ResponseEntity
+                .status(ex.status())
+                .body(new ApiError(ex.status().value(), ex.getMessage()));
+    }
 }
