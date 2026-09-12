@@ -97,3 +97,69 @@ compiler in production. No secrets in the image — injected at runtime.
 - `content().get(0)` still throws on an error or empty response → 500.
 - No rate limiting, so a leaked gateway key can still drain the credit.
 - No README yet.
+
+## Session 3 — Sep 12, 2026: timeouts, error handling, retries
+
+**Timeouts**
+Connect 5s, read 30s. Asymmetric on purpose: establishing a TCP connection
+should be near-instant, so 5s means the network is broken and waiting longer
+won't help. Generating 1024 tokens legitimately takes time, so a tight read
+timeout would kill healthy requests. Before this there were no timeouts at all —
+a hung provider request could pin a Tomcat thread forever, and enough of those
+means the gateway itself becomes the outage.
+
+**Validate at the boundary**
+Empty prompt → 400 before any network call. The cheapest request is the one you
+don't make, and a caller who sent bad input deserves a 400, not a 500 implying
+my service broke.
+
+**One error contract**
+`GatewayExceptionHandler` (`@RestControllerAdvice`) returns `{status, message}`
+for every failure. Callers can't tell which exception type produced it, and
+shouldn't be able to.
+
+**Retryability is a property of the failure, not the status code**
+The design decision I'd defend in an interview. Bad credentials and "provider is
+down" both map to 502 on the way out. If I decided retryability by reading 502,
+I'd retry a broken API key three times for nothing. So `DownstreamException`
+carries a `retryable` flag, set where the cause is actually known.
+
+| Provider says | I return | Retry? |
+|---|---|---|
+| 400 | 400 | no — malformed now, malformed next time |
+| 401/403 | 502 | no — retrying can't fix a credential |
+| 429 | 429 | yes — rate limits are temporary by definition |
+| 5xx | 502 | yes — their server had a bad moment |
+| timeout | 504 | yes — could be a blip |
+| empty response | 502 | no — contract violation, not a blip |
+
+401/403 becomes 502 deliberately: the caller did nothing wrong and can't fix it.
+Returning 401 would make them think *their* gateway key was bad.
+
+Provider error text is never passed through. Only my wording goes out — upstream
+error messages can carry internal details, and leaking them is how information
+disclosure happens.
+
+**Retries: 3 attempts, exponential backoff, jitter**
+500ms then 1000ms. Doubling because hammering a struggling provider every 100ms
+makes it worse. Jitter because if a thousand clients fail at the same instant and
+all retry at exactly 500ms, that's a synchronized stampede that knocks the
+service over again.
+
+`Thread.currentThread().interrupt()` restored before throwing — catching
+`InterruptedException` swallows the signal and breaks graceful shutdown.
+
+**Configurable downstream URL**
+`anthropic.base-url` with a default. A hardcoded base URL is untestable, and this
+is also the groundwork for a fallback provider.
+
+**Verified, not assumed**
+- Bogus base URL → 3 WARN lines; log timestamps 622ms and 1206ms apart against
+  requested delays of 611ms and 1200ms. Then 504.
+- Bogus API key → exactly 1 attempt, 502. The flag works in both directions.
+
+**Biggest remaining weakness**
+No overall request deadline. 3 attempts × 30s read timeout + backoff is a worst
+case near 90 seconds for a single caller. Per-attempt timeouts aren't enough —
+the real answer is a budget for the whole request, checked before each retry.
+Also no circuit breaker, so retries still pound a provider that's fully down.
