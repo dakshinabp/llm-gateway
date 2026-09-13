@@ -163,3 +163,45 @@ No overall request deadline. 3 attempts × 30s read timeout + backoff is a worst
 case near 90 seconds for a single caller. Per-attempt timeouts aren't enough —
 the real answer is a budget for the whole request, checked before each retry.
 Also no circuit breaker, so retries still pound a provider that's fully down.
+
+## Session 4 — Sep 13, 2026: rate limiting and first tests
+
+**Per-key rate limiting**
+Counts requests per gateway key per clock minute. Over the limit returns 429 with
+`Retry-After: 60`, so callers know when to come back instead of retrying
+immediately. `ConcurrentHashMap.compute` makes the increment safe when many
+requests land at once.
+
+Counted per key rather than globally. There's one key today because there's one
+user, but issuing more keys later needs no code change.
+
+The key check runs before the limit check. Counting unknown keys would let anyone
+fill the map with made-up keys.
+
+**Rejected requests still count toward the limit.** A 400 is still a request the
+gateway had to handle. Deliberate, not an oversight.
+
+**Known weaknesses**
+- Counter is in memory. Two instances = two counters = double the real limit.
+  Shared storage (Redis) is the fix.
+- Fixed window, not sliding. 10 requests at 10:00:59 and 10 more at 10:01:00 is
+  20 in one second and technically allowed.
+
+**First tests — 7 of them**
+
+`RateLimiterTest`: limit enforcement, per-key isolation, and window reset.
+The reset test is only possible because `RateLimiter` takes a `Clock` instead of
+calling the system clock directly — the test hands it a clock it controls and
+jumps forward a minute. Without that, the test would have to sleep 60 seconds,
+which means in practice nobody writes it and the reset never gets tested.
+
+`ChatEndpointTest`: `MockMvc` sends fake HTTP requests through the real filter
+chain — 401 with no key, 400 on an empty prompt, 200 returning the model answer.
+`AnthropicClient` is replaced with a mock, so the tests never touch the network,
+never cost money, and give the same result every run.
+
+**Tests must not need real secrets**
+`src/test/resources/application.properties` holds fake values. The base URL points
+at a dead port, so if a test ever did attempt a real call it fails immediately
+rather than quietly reaching the internet. Verified by running the suite with the
+real environment variables deliberately removed.
