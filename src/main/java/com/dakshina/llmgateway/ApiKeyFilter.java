@@ -13,9 +13,12 @@ import org.springframework.web.filter.OncePerRequestFilter;
 public class ApiKeyFilter extends OncePerRequestFilter {
 
     private final String expectedKey;
+    private final RateLimiter rateLimiter;
 
-    public ApiKeyFilter(@Value("${gateway.api-key}") String expectedKey) {
+    public ApiKeyFilter(@Value("${gateway.api-key}") String expectedKey,
+                        RateLimiter rateLimiter) {
         this.expectedKey = expectedKey;
+        this.rateLimiter = rateLimiter;
     }
 
     @Override
@@ -25,15 +28,29 @@ public class ApiKeyFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         if (request.getRequestURI().startsWith("/v1/")) {
+
             String provided = request.getHeader("X-Gateway-Key");
             if (provided == null || !provided.equals(expectedKey)) {
-                response.setStatus(401);
-                response.setContentType("application/json");
-                response.getWriter().write("{\"error\":\"missing or invalid X-Gateway-Key\"}");
+                reject(response, 401, "missing or invalid X-Gateway-Key");
+                return;
+            }
+
+            if (!rateLimiter.allow(provided)) {
+                response.setHeader("Retry-After", "60");
+                reject(response, 429, "rate limit exceeded, try again shortly");
                 return;
             }
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    private void reject(HttpServletResponse response, int status, String message)
+            throws IOException {
+        response.setStatus(status);
+        response.setContentType("application/json");
+        response.setCharacterEncoding("UTF-8");
+        response.getWriter().write(
+                "{\"status\":" + status + ",\"message\":\"" + message + "\"}");
     }
 }
