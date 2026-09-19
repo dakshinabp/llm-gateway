@@ -205,3 +205,61 @@ never cost money, and give the same result every run.
 at a dead port, so if a test ever did attempt a real call it fails immediately
 rather than quietly reaching the internet. Verified by running the suite with the
 real environment variables deliberately removed.
+
+## Session 5 — Sep 19, 2026: cost tracking and caching
+
+**Model name moved into config**
+`claude-sonnet-4-5` was hardcoded and has since been retired on Anthropic's API.
+A model name that someone else can switch off doesn't belong in compiled code.
+Now `anthropic.model`, currently `claude-sonnet-5`.
+
+**Token counts**
+`AnthropicResponse` had been declaring only `content` and throwing away the
+`usage` block that arrives on every response. Declaring it keeps it.
+`AnthropicClient.complete()` now returns a `CompletionResult` — the answer text
+plus input and output token counts — instead of a bare String.
+
+If a response ever arrives with no usage block, the counts record as zero rather
+than throwing. Cost tracking failing should never break a request that worked.
+
+**Cost tracking**
+`UsageTracker` keeps running totals per gateway key: requests, input tokens,
+output tokens. Cost is tokens ÷ 1,000,000 × price per million, input and output
+priced separately. Prices live in config because they change on Anthropic's
+schedule, not mine.
+
+Uses `double`, which is not precise enough for real money — a billing system
+would use `BigDecimal`. This is a spend estimate for visibility, not an invoice.
+
+`GET /v1/usage` returns the totals. It sits under `/v1` so the same filter
+protects it, and callers only ever see their own key's numbers.
+
+**Response caching**
+`ResponseCache` is a bounded LRU cache — a `LinkedHashMap` in access order with
+`removeEldestEntry`, capped at 500. Bounded because an unbounded cache grows
+until the service runs out of memory. Access-order means the least *recently
+used* entry is dropped, so popular prompts stay cached.
+
+The controller checks the cache before calling Anthropic. A cache hit returns
+immediately and **records nothing in the tracker** — no tokens were spent, so
+nothing should be added to the bill.
+
+**Verified live**
+- Fresh prompt: 1.785s. Same prompt again: 0.008s. Roughly 200x.
+- `/v1/usage` showed 2 requests after 3 calls — the cached one added nothing.
+- Cost math checked by hand: 29 input × $2/M + 172 output × $10/M = $0.001778,
+  which matched exactly.
+
+**Caching an LLM is a tradeoff, not a free win**
+The same prompt normally produces a slightly different answer each time. Caching
+means everyone after the first gets an identical one. Fine for repeated factual
+questions, wrong for anything creative. Real gateways make it opt-in per request.
+
+**Known gaps**
+- Cache key is the prompt only. Change the model and you still serve answers
+  from the old one. Including the model in the key fixes it.
+- Nothing expires, and it's in memory — a restart loses everything, and two
+  instances have two separate caches. Redis with a TTL is the real answer.
+- Same in-memory limitation as the rate limiter, for the same reason.
+- Cache hits aren't counted anywhere. Hit rate is the number you'd actually want
+  to show someone.
