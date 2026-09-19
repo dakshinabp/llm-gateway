@@ -19,15 +19,17 @@ public class AnthropicClient {
 
     private static final Logger log = LoggerFactory.getLogger(AnthropicClient.class);
 
-    private static final String MODEL = "claude-sonnet-4-5";
     private static final int MAX_TOKENS = 1024;
     private static final int MAX_ATTEMPTS = 3;
     private static final long BASE_BACKOFF_MS = 500;
-
+    private final String model;
     private final RestClient restClient;
 
     public AnthropicClient(@Value("${anthropic.api-key}") String apiKey,
-                           @Value("${anthropic.base-url}") String baseUrl) {
+                           @Value("${anthropic.base-url}") String baseUrl,
+                           @Value("${anthropic.model}") String model) {
+
+        this.model = model;
 
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
@@ -46,9 +48,9 @@ public class AnthropicClient {
                 .build();
     }
 
-    public String complete(String prompt) {
+    public CompletionResult complete(String prompt) {
         AnthropicRequest body = new AnthropicRequest(
-                MODEL,
+                model,
                 MAX_TOKENS,
                 List.of(new AnthropicRequest.Message("user", prompt)));
 
@@ -68,7 +70,7 @@ public class AnthropicClient {
         }
     }
 
-    private String callOnce(AnthropicRequest body) {
+    private CompletionResult callOnce(AnthropicRequest body) {
         AnthropicResponse response;
         try {
             response = restClient.post()
@@ -88,7 +90,12 @@ public class AnthropicClient {
                     "model provider returned an empty response", false);
         }
 
-        return response.content().get(0).text();
+        AnthropicResponse.Usage usage = response.usage();
+
+        return new CompletionResult(
+                response.content().get(0).text(),
+                usage == null ? 0 : usage.inputTokens(),
+                usage == null ? 0 : usage.outputTokens());
     }
 
     private DownstreamException translate(RestClientResponseException e) {
